@@ -1,0 +1,15 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - pip install -r index-photos/requirements.txt -t index-photos/
+      - pip install -r search-photos/requirements.txt -t search-photos/
+  build:
+    commands:
+      - aws cloudformation package --template-file index-photos/index-photos-template.yaml --output-template-file index-photos/packaged-index-photos-template.yaml --s3-bucket photo-album-artifacts --s3-prefix index-photos/
+      - aws cloudformation package --template-file search-photos/search-photos-template.yaml --output-template-file search-photos/packaged-search-photos-template.yaml --s3-bucket photo-album-artifacts --s3-prefix search-photos/
+      - aws cloudformation package --template-file parent-template.yaml --output-template-file packaged-parent-template.yaml --s3-bucket photo-album-artifacts
+
+artifacts:
+  files:
+    - parent-template.yaml  # Just the parent template

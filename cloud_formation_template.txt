@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for photo album application
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: album-photo-store-ha1
+
+  S3Bucket2:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: smart-photo-album-frontend-ha1
+
+  IndexPhotosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: indexing-photos
+      Handler: index.lambda_handler
+      Role: arn:aws:iam::442426876105:role/service-role/index-photos-role-0fz0acrm
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+          def lambda_handler(event, context):
+                # Get the S3 bucket and file information from the event
+                bucket = event['Records'][0]['s3']['bucket']['name']
+                key = event['Records'][0]['s3']['object']['key']
+                # Initialize AWS clients
+                s3 = boto3.client('s3')
+                rekognition = boto3.client('rekognition')
+                # Use Rekognition to detect labels
+                try:
+                    response = rekognition.detect_labels(
+                        Image={
+                            'S3Object': {
+                                'Bucket': bucket,
+                                'Name': key
+                            }
+                        },
+                        MaxLabels=10,
+                        MinConfidence=70
+                    )
+                    labels = [label['Name'] for label in response['Labels']]
+                except Exception as e:
+                    print("Error detecting labels:", e)
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps('Error detecting labels')
+                    }
+                # Get custom labels from S3 object metadata
+                try:
+                    metadata = s3.head_object(Bucket=bucket, Key=key)
+                    custom_labels = metadata.get('Metadata', {}).get('customlabels', '').split(',')
+                except Exception as e:
+                    print("Error retrieving metadata:", e)
+                    custom_labels = []
+                # Combine detected and custom labels
+                all_labels = labels + custom_labels
+                # Index the photo in OpenSearch
+                try:
+                    index_to_opensearch(bucket, key, all_labels)
+                except Exception as e:
+                    print("Error indexing photo:", e)
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps('Error indexing photo')
+                    }
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Photo indexed successfully!')
+                }
+            def index_to_opensearch(bucket, key, labels):
+                region = 'us-east-1'
+                service = 'es'
+                credentials = boto3.Session().get_credentials()
+                awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
+                host = 'search-photos-2iks6dqb6qtlhwbubkkgjpk3qy.us-east-1.es.amazonaws.com'
+                index = 'photos'
+                opensearch = OpenSearch(
+                    hosts=[{'host': host, 'port': 443}],
+                    http_auth=awsauth,
+                    use_ssl=True,
+                    verify_certs=True,
+                    connection_class=RequestsHttpConnection
+                )
+                document = {
+                    'objectKey': key,
+                    'bucket': bucket,
+                    'createdTimestamp': datetime.now().isoformat(),
+                    'labels': labels
+                }
+                response = opensearch.index(index=index, body=document)
+                print("Document indexed successfully:", response)
+
+      Runtime: python3.13
+      Timeout: 60
+      MemorySize: 128
+      Layers:
+        - arn:aws:lambda:us-east-1:442426876105:layer:dependencies:1
+
+  SearchPhotosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: searching-photos
+      Handler: index.lambda_handler
+      Role: arn:aws:iam::442426876105:role/service-role/index-photos-role-0fz0acrm
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import re
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+          def lambda_handler(event, context):
+                    try:
+                        query = event['queryStringParameters']['q']
+                        keywords = extract_keywords(query)
+                        results = search_opensearch(keywords)
+                        return {
+                            'statusCode': 200,
+                            'body': json.dumps({'results': results}),
+                            'headers': {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*',
+                                'Access-Control-Allow-Methods': 'GET,OPTIONS',
+                                'Access-Control-Allow-Headers': 'Content-Type'
+                            }
+                        }
+                    except Exception as e:
+                        return {
+                            'statusCode': 500,
+                            'body': json.dumps({'error': str(e)}),
+                            'headers': {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*',
+                                'Access-Control-Allow-Methods': 'GET,OPTIONS',
+                                'Access-Control-Allow-Headers': 'Content-Type'
+                            }
+                        }
+                def extract_keywords(query):
+                    cleaned_query = re.sub(r'[^\w\s]', '', query.lower())
+                    words = cleaned_query.split()
+                    # Remove common stop words (you can expand this list)
+                    stop_words = set(['the', 'a', 'an', 'in', 'on', 'at', 'for', 'to', 'of', 'with', 'by','show','me','images','pictures','search'])
+                    keywords = [word for word in words if word not in stop_words]
+                    return keywords
+                def search_opensearch(keywords):
+                    # OpenSearch configuration
+                    host = 'search-photos-2iks6dqb6qtlhwbubkkgjpk3qy.us-east-1.es.amazonaws.com'
+                    region = 'us-east-1'
+                    index = 'photos'
+                    # AWS credentials
+                    service = 'es'
+                    credentials = boto3.Session().get_credentials()
+                    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
+                    # Initialize OpenSearch client
+                    opensearch = OpenSearch(
+                        hosts=[{'host': host, 'port': 443}],
+                        http_auth=awsauth,
+                        use_ssl=True,
+                        verify_certs=True,
+                        connection_class=RequestsHttpConnection
+                    )
+                    # Construct the search query
+                    query = {
+                        'query': {
+                            'bool': {
+                                'should': [{'match': {'labels': keyword}} for keyword in keywords]
+                            }
+                        }
+                    }
+                    # Perform the search
+                    response = opensearch.search(index=index, body=query)
+                    # Extract and format the results
+                    results = []
+                    for hit in response['hits']['hits']:
+                        results.append({
+                            'objectKey': hit['_source']['objectKey'],
+                            'bucket': hit['_source']['bucket'],
+                            'createdTimestamp': hit['_source']['createdTimestamp'],
+                            'labels': hit['_source']['labels']
+                        })
+                    return results
+
+      Runtime: python3.13
+      Timeout: 60
+      MemorySize: 128
+      Layers:
+        - arn:aws:lambda:us-east-1:442426876105:layer:dependencies:1
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Photo Search HA1
+      ApiKeySourceType: HEADER
+      BinaryMediaTypes:
+        - image/*
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+Outputs:
+  FrontendURL:
+    Description: URL for the frontend website
+    Value: !GetAtt S3Bucket2.WebsiteURL
